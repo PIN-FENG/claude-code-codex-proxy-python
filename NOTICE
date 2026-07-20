@@ -1,0 +1,22 @@
+Attribution Notice
+==================
+
+This repository is a Python port and derivative work based on:
+
+    claude-code-proxy
+    https://github.com/raine/claude-code-proxy
+    Copyright (c) 2026 Raine Virta
+    Licensed under the MIT License
+
+The upstream copyright notice and complete MIT License terms are retained in
+LICENSE. This derivative work is also distributed under the MIT License.
+
+Compared with the upstream project, this port provides a single-file Python
+3.11 implementation, Windows-focused setup instructions, local shared-secret
+authentication, and a narrower documented compatibility surface.
+
+This port is maintained independently. Report issues for this port in this
+repository; do not request support from the upstream author. No endorsement by
+Raine Virta, Anthropic, or OpenAI is implied. Claude, Claude Code, Codex,
+ChatGPT, OpenAI, and related names may be trademarks of their respective
+owners.
