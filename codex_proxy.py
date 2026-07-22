@@ -131,7 +131,7 @@ def read_settings() -> CodexSettings:
         or _string(profile.get("model_reasoning_effort"))
         or _string(config.get("model_reasoning_effort"))
     )
-    if effort and effort not in {"none", "minimal", "low", "medium", "high", "xhigh"}:
+    if effort and effort not in {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}:
         raise ProxyError(f"Unsupported Codex reasoning effort: {effort}")
     return CodexSettings(home, model, effort)
 
@@ -1142,7 +1142,7 @@ def main() -> int:
     read_auth(settings)  # fail before opening the listener; values are not retained
     server = LocalServer(("127.0.0.1", args.port), ProxyHandler)
     print(f"Codex proxy listening on http://127.0.0.1:{args.port}")
-    print(f"Using configured model: {settings.model}")
+    print(f"Using configured model: {settings.model} {settings.reasoning_effort}")
     try:
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:
