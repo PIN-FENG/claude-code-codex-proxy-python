@@ -33,6 +33,8 @@ from typing import Any, BinaryIO, Iterator
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
+from dotenv import load_dotenv
+load_dotenv()
 
 try:
     import tomllib
@@ -47,6 +49,23 @@ UPSTREAM_TIMEOUT_SECONDS = 600
 CHATGPT_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 ALLOWED_UPSTREAM_ENDPOINTS = frozenset({CHATGPT_RESPONSES_URL, OPENAI_RESPONSES_URL})
+SAFE_ERROR_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+SENSITIVE_ERROR_ASSIGNMENT_RE = re.compile(
+    r'''(?ix)
+    (
+        ["']?\b(?:api[_-]?key|x-api-key|authorization|access[_-]?token|
+        refresh[_-]?token|id[_-]?token|token|secret)\b["']?\s*(?:=|:)\s*
+    )
+    (?:Bearer\s+["']?[^\s,;"']+["']?|"[^"]*"|'[^']*'|[^\s,;&}\]]+)
+    '''
+)
+BEARER_CREDENTIAL_RE = re.compile(r"(?i)\bBearer\s+[\"']?[^\s,;\"']+[\"']?")
+KNOWN_API_KEY_RE = re.compile(r"(?i)\b(?:sk|rk|pk|sess)-[A-Za-z0-9_-]{8,}\b")
+JWT_CREDENTIAL_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?![A-Za-z0-9_-])"
+)
+OPAQUE_CREDENTIAL_RE = re.compile(r"(?<![A-Za-z0-9_+/=])[A-Za-z0-9_+/=]{40,}(?![A-Za-z0-9_+/=])")
+MAX_UPSTREAM_ERROR_MESSAGE_CHARS = 500
 
 
 class RejectRedirects(HTTPRedirectHandler):
@@ -509,6 +528,56 @@ def upstream_http_error_message(status: int) -> str:
     return f"OpenAI returned HTTP {status}"
 
 
+def safe_error_identifier(value: Any) -> str | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        value = str(value)
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value if SAFE_ERROR_IDENTIFIER_RE.fullmatch(value) else None
+
+
+def sanitize_upstream_error_message(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    message = " ".join(value.split())
+    if not message:
+        return None
+    message = SENSITIVE_ERROR_ASSIGNMENT_RE.sub(lambda match: match.group(1) + "[REDACTED]", message)
+    message = BEARER_CREDENTIAL_RE.sub("Bearer [REDACTED]", message)
+    message = KNOWN_API_KEY_RE.sub("[REDACTED]", message)
+    message = JWT_CREDENTIAL_RE.sub("[REDACTED]", message)
+    message = OPAQUE_CREDENTIAL_RE.sub("[REDACTED]", message)
+    message = message[:MAX_UPSTREAM_ERROR_MESSAGE_CHARS].rstrip()
+    if not message or message in {"[REDACTED]", "Bearer [REDACTED]"}:
+        return None
+    return message
+
+
+def upstream_sse_error_message(event: dict[str, Any]) -> str:
+    details: Any = event.get("error")
+    if event.get("type") == "response.failed":
+        response = event.get("response")
+        details = response.get("error") if isinstance(response, dict) else None
+    if not isinstance(details, dict):
+        return "OpenAI response failed"
+
+    error_type = safe_error_identifier(details.get("type"))
+    code = safe_error_identifier(details.get("code"))
+    message = sanitize_upstream_error_message(details.get("message"))
+    metadata = ", ".join(
+        part for part in (f"type={error_type}" if error_type else "", f"code={code}" if code else "") if part
+    )
+    result = "OpenAI response failed"
+    if metadata:
+        result += f" ({metadata})"
+    if message:
+        result += f": {message}"
+    return result
+
+
 def iter_sse(stream: BinaryIO) -> Iterator[dict[str, Any]]:
     data_lines: list[str] = []
     for raw in stream:
@@ -770,7 +839,7 @@ class AnthropicTranslator:
         if kind == "response.incomplete":
             return self._finish(event, incomplete=True)
         if kind in {"response.failed", "error"}:
-            raise ProxyError("OpenAI response failed", 502)
+            raise ProxyError(upstream_sse_error_message(event), 502)
         return []
 
 
@@ -779,19 +848,21 @@ def sse_bytes(event: str, data: dict[str, Any]) -> bytes:
     return f"event: {event}\ndata: {payload}\n\n".encode("utf-8")
 
 
-def usage_summary(model: str, usage: dict[str, int]) -> str:
+def usage_summary(model: str, reasoning_effort: str | None, usage: dict[str, int]) -> str:
     input_tokens = int(usage.get("input_tokens") or 0)
     cached_tokens = int(usage.get("cache_read_input_tokens") or 0)
     output_tokens = int(usage.get("output_tokens") or 0)
     total_tokens = input_tokens + cached_tokens + output_tokens
+    effort = reasoning_effort or "default"
     return (
-        f"Codex usage: model={model} input={input_tokens} cached={cached_tokens} "
-        f"output={output_tokens} total={total_tokens}"
-    )
+          f"Codex usage: model={model} reasoning_effort={effort} "
+          f"input={input_tokens} cached={cached_tokens} "
+          f"output={output_tokens} total={total_tokens}"
+      )
 
 
-def print_usage(model: str, usage: dict[str, int]) -> None:
-    print(usage_summary(model, usage), flush=True)
+def print_usage(model: str, reasoning_effort: str | None, usage: dict[str, int]) -> None:
+    print(usage_summary(model, reasoning_effort, usage), flush=True)
 
 
 def approximate_tokens(value: Any) -> int:
@@ -860,9 +931,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
             downstream_model = _string(body.get("model")) or settings.model
             try:
                 if body.get("stream") is False:
-                    self._non_streaming(stream, downstream_model, settings.model)
+                    self._non_streaming(
+                        stream,
+                        downstream_model,
+                        settings.model,
+                        settings.reasoning_effort,
+                    )
                 else:
-                    self._streaming(stream, downstream_model, settings.model)
+                    self._streaming(
+                        stream,
+                        downstream_model,
+                        settings.model,
+                        settings.reasoning_effort,
+                    )
             finally:
                 stream.close()
         except ProxyError as exc:
@@ -900,7 +981,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
             raise ProxyError("Request body must be a JSON object", 400)
         return value
 
-    def _streaming(self, stream: BinaryIO, model: str, usage_model: str) -> None:
+    def _streaming(
+        self,
+        stream: BinaryIO,
+        model: str,
+        usage_model: str,
+        reasoning_effort: str | None,
+    ) -> None:
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -915,20 +1002,26 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     self.wfile.flush()
             if not translator.finished:
                 raise ProxyError("OpenAI stream ended before a completion event", 502)
-            print_usage(usage_model, translator.usage)
+            print_usage(usage_model, reasoning_effort, translator.usage)
         except ProxyError as exc:
             debug(f"stream translation failed status={exc.status} detail={str(exc)!r}")
             data = {"type": "error", "error": {"type": "api_error", "message": str(exc)}}
             self.wfile.write(sse_bytes("error", data))
             self.wfile.flush()
 
-    def _non_streaming(self, stream: BinaryIO, model: str, usage_model: str) -> None:
+    def _non_streaming(
+        self,
+        stream: BinaryIO,
+        model: str,
+        usage_model: str,
+        reasoning_effort: str | None,
+    ) -> None:
         translator = AnthropicTranslator(model)
         for upstream_event in iter_sse(stream):
             translator.feed(upstream_event)
         if not translator.finished:
             raise ProxyError("OpenAI stream ended before a completion event", 502)
-        print_usage(usage_model, translator.usage)
+        print_usage(usage_model, reasoning_effort, translator.usage)
         document = {
             "id": translator.message_id,
             "type": "message",
@@ -1031,8 +1124,9 @@ def self_test() -> None:
         "output_tokens": 3,
         "cache_read_input_tokens": 4,
     }
-    assert usage_summary("gpt-test", translator.usage) == (
-        "Codex usage: model=gpt-test input=6 cached=4 output=3 total=13"
+    assert usage_summary("gpt-test", "high", translator.usage) == (
+        "Codex usage: model=gpt-test reasoning_effort=high "
+        "input=6 cached=4 output=3 total=13"
     )
     assert emitted[0][0] == "message_start" and emitted[-1][0] == "message_stop"
 
@@ -1094,8 +1188,71 @@ def self_test() -> None:
         failed.feed({"type": "error", "error": {"message": "Bearer secret-placeholder"}})
     except ProxyError as exc:
         assert str(exc) == "OpenAI response failed"
+        assert "secret-placeholder" not in str(exc)
     else:
         raise AssertionError("Upstream error event was accepted")
+
+    safe_failure = AnthropicTranslator("gpt-test")
+    try:
+        safe_failure.feed(
+            {
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "context_length_exceeded",
+                    "message": "Input exceeded the supported context window.",
+                },
+            }
+        )
+    except ProxyError as exc:
+        assert str(exc) == (
+            "OpenAI response failed (type=invalid_request_error, "
+            "code=context_length_exceeded): Input exceeded the supported context window."
+        )
+    else:
+        raise AssertionError("Detailed upstream error event was accepted")
+
+    nested_failure = AnthropicTranslator("gpt-test")
+    try:
+        nested_failure.feed(
+            {
+                "type": "response.failed",
+                "response": {
+                    "error": {
+                        "type": "server_error",
+                        "code": 500,
+                        "message": (
+                            "Temporary failure; authorization=Bearer top-secret-token; "
+                            "api_key=sk-exampleSecret123456789; retry later."
+                        ),
+                    }
+                },
+            }
+        )
+    except ProxyError as exc:
+        rendered = str(exc)
+        assert rendered.startswith("OpenAI response failed (type=server_error, code=500):")
+        assert "retry later" in rendered
+        assert "top-secret-token" not in rendered
+        assert "sk-exampleSecret123456789" not in rendered
+        assert "[REDACTED]" in rendered
+    else:
+        raise AssertionError("Nested upstream failure event was accepted")
+
+    hostile_metadata = upstream_sse_error_message(
+        {
+            "type": "error",
+            "error": {
+                "type": "Bearer unsafe-token",
+                "code": "sk-secretSecret123456789",
+                "message": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyMTIzIn0.signature12345678",
+            },
+        }
+    )
+    assert hostile_metadata == "OpenAI response failed"
+    assert upstream_sse_error_message({"type": "response.failed", "response": {}}) == (
+        "OpenAI response failed"
+    )
 
     print("Self-test passed")
 
@@ -1111,7 +1268,7 @@ def check_configuration() -> None:
     settings = read_settings()
     auth = read_auth(settings)
     print(f"Codex home: {settings.codex_home}")
-    print(f"Model: {settings.model}")
+    print(f"Model: {settings.model} {settings.reasoning_effort}")
     print(f"Reasoning effort: {settings.reasoning_effort or 'Codex default'}")
     print(f"Authentication: {auth.mode}")
     print(f"Account ID present: {'yes' if auth.account_id else 'not required'}")
